@@ -49,7 +49,6 @@ class OllamaToolAgent:
             base_url=base_url,
             temperature=0.0,  # Zero for more deterministic output
             num_predict=512,  # Limit response length to prevent rambling
-            stop=["Observation:", "\nObservation"]  # Stop at observation markers
         )
 
         # Load tools from database
