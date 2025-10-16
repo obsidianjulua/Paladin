@@ -47,8 +47,9 @@ class OllamaToolAgent:
         self.llm = ChatOllama(
             model=model_name,
             base_url=base_url,
-            temperature=0.0,  # Zero for more deterministic output
-            num_predict=512,  # Limit response length to prevent rambling
+            temperature=0.1,  # Very low but not zero to allow some flexibility
+            num_predict=1024,  # Increased to prevent truncation of responses
+            timeout="5m"  # Add explicit timeout for LLM calls
         )
 
         # Load tools from database
@@ -136,17 +137,26 @@ Thought:{agent_scratchpad}"""
         prompt = PromptTemplate.from_template(template)
         agent = create_react_agent(self.llm, self.tools, prompt)
 
-        # Custom parsing error handler
+        # Custom parsing error handler with fallback
+        parse_error_count = {"count": 0}
+
         def handle_parse_error(error) -> str:
+            parse_error_count["count"] += 1
+            logger.warning(f"Parse error #{parse_error_count['count']}: {error}")
+
+            # After 2 parse errors, force a final answer
+            if parse_error_count["count"] >= 2:
+                return "Too many formatting errors. Providing best available answer based on context so far."
+
             return f"Could not parse LLM output. Please respond using the exact format:\nThought: [your thought]\nAction: [tool name]\nAction Input: [input]\n\nError details: {str(error)}"
 
         agent_executor = AgentExecutor(
             agent=agent,
             tools=self.tools,
             verbose=True,
-            max_iterations=5,  # Reduced from 10 to fail faster
-            max_execution_time=60,  # Reduced from 300 to fail faster
-            handle_parsing_errors=handle_parse_error,  # Custom error handler
+            max_iterations=3,  # Reduced from 5 to fail even faster
+            max_execution_time=30,  # Reduced from 60 to fail faster
+            handle_parsing_errors=handle_parse_error,  # Custom error handler with counter
             early_stopping_method="generate",  # Return what we have so far on failure
             return_intermediate_steps=False  # Don't clutter output
         )
@@ -154,6 +164,24 @@ Thought:{agent_scratchpad}"""
 
     def chat(self, message: str) -> str:
         """Processes a chat message, running the agent and updating memory."""
+        import signal
+        from contextlib import contextmanager
+
+        @contextmanager
+        def timeout_context(seconds):
+            """Context manager for timeout using signals (Unix only)."""
+            def timeout_handler(signum, frame):
+                raise TimeoutError(f"Agent execution exceeded {seconds} seconds")
+
+            # Set the signal handler and alarm
+            old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(seconds)
+            try:
+                yield
+            finally:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_handler)
+
         self.db.add_message(self.session_id, "human", message)
 
         console.print(Panel(
@@ -163,8 +191,10 @@ Thought:{agent_scratchpad}"""
         ))
 
         try:
-            result = self.agent_executor.invoke({"input": message})
-            response = result.get('output', 'No response generated.')
+            # Add a hard timeout of 45 seconds (15 seconds buffer over agent's 30s timeout)
+            with timeout_context(45):
+                result = self.agent_executor.invoke({"input": message})
+                response = result.get('output', 'No response generated.')
 
             self.db.add_message(self.session_id, "assistant", response)
 
@@ -175,6 +205,17 @@ Thought:{agent_scratchpad}"""
             ))
             return response
 
+        except TimeoutError as e:
+            error_msg = f"Agent Timeout: {e}. The agent took too long to respond. Try simplifying your request."
+            self.db.add_message(self.session_id, "assistant", error_msg)
+            console.print(Panel(
+                Text(error_msg, style="bold red"),
+                title="Timeout",
+                border_style="red"
+            ))
+            logger.error(f"Agent timeout on message: {message}")
+            return error_msg
+
         except Exception as e:
             error_msg = f"Agent Execution Error: {e}"
             self.db.add_message(self.session_id, "assistant", error_msg)
@@ -183,6 +224,7 @@ Thought:{agent_scratchpad}"""
                 title="Error",
                 border_style="red"
             ))
+            logger.exception(f"Agent error on message: {message}")
             return error_msg
 
     def execute_tool_chain(self, chain_definition: List[Dict[str, Any]],

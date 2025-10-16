@@ -14,7 +14,7 @@ from langchain.agents import Tool
 
 logger = logging.getLogger(__name__)
 
-TOOL_DB_PATH = "/home/grim/Desktop/op/TOOL_DB/tools.db"
+TOOL_DB_PATH = "/home/grim/Desktop/Projects/Paladin/TOOL_DB/tools.db"
 
 
 class ToolRegistry:
