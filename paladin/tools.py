@@ -28,7 +28,7 @@ class FileTools:
             return f"Error creating file: {e}"
 
     @staticmethod
-    def read_file(path: str, max_chars: int = 5000) -> str:
+    def read_file(path: str, max_chars: int = 50000) -> str:
         """Reads the content of a file. Returns full content for AI analysis."""
         try:
             p = Path(path)

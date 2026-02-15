@@ -6,11 +6,19 @@ Ollama Tool Agent - Main agent implementation
 import hashlib
 import json
 import logging
+import os
+import signal
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Union
+
+from dotenv import load_dotenv
 from langchain_ollama import ChatOllama
-from langchain.agents import AgentExecutor, create_react_agent
-from langchain_core.prompts import PromptTemplate
+from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain.callbacks.base import BaseCallbackHandler
+from langchain.schema import AgentAction, AgentFinish
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
@@ -18,21 +26,72 @@ from rich.text import Text
 from .vector_db import VectorDatabase
 from .tool_registry import ToolRegistry
 
+# Load environment variables
+load_dotenv()
+
 logger = logging.getLogger(__name__)
 console = Console()
 
-DEFAULT_MODEL = "codellama:7b-instruct-q4_K_M"
-DEFAULT_BASE_URL = "http://localhost:11434"
+DEFAULT_MODEL = os.getenv("PALADIN_MODEL", "qwen3-coder:latest")
+DEFAULT_BASE_URL = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+
+
+class RichCallbackHandler(BaseCallbackHandler):
+    """Custom callback handler to render agent actions nicely with Rich."""
+    
+    def __init__(self, console: Console):
+        self.console = console
+        self.status = None
+        self.current_tool = None
+        self.step_color = "cyan"
+    
+    def on_chain_start(self, serialized, inputs, **kwargs):
+        """Start the spinner when the chain begins."""
+        # Only start if it's the main agent chain (heuristic)
+        if not self.status:
+            self.status = self.console.status("[bold green]Paladin is thinking...", spinner="dots")
+            self.status.start()
+
+    def on_agent_action(self, action: AgentAction, **kwargs):
+        """Update spinner when a tool is selected."""
+        self.current_tool = action.tool
+        if self.status:
+            self.status.update(f"[bold {self.step_color}]Executing tool: {action.tool}...")
+
+    def on_tool_end(self, output: str, **kwargs):
+        """Update spinner when tool finishes."""
+        if self.status:
+            self.status.update(f"[bold {self.step_color}]Finished {self.current_tool}. Processing results...")
+    
+    def on_chain_end(self, outputs, **kwargs):
+        """Stop spinner when done."""
+        if self.status:
+            self.status.stop()
+            self.status = None
+
+    def on_agent_finish(self, finish: AgentFinish, **kwargs):
+        if self.status:
+            self.status.stop()
+            self.status = None
 
 
 class OllamaToolAgent:
-    """Agent that uses Ollama, tools from database, and vector memory via ReAct pattern."""
+    """Agent that uses Ollama, tools from database, and vector memory via Native Tool Calling."""
 
     def __init__(self, model_name: str = DEFAULT_MODEL, base_url: str = DEFAULT_BASE_URL,
                  session_id: Optional[str] = None, vector_db_path: Optional[str] = None,
-                 tool_db_path: Optional[str] = None, init_search_query: Optional[str] = None):
+                 tool_db_path: Optional[str] = None, init_search_query: Optional[str] = None,
+                 save_history: bool = True):
 
         self.session_id = session_id or hashlib.md5(str(datetime.now()).encode()).hexdigest()
+        self.save_history = save_history
+
+        # Load DB paths from env if not provided
+        if not vector_db_path:
+            vector_db_path = os.getenv("PALADIN_VECTOR_DB")
+        
+        if not tool_db_path:
+            tool_db_path = os.getenv("PALADIN_TOOL_DB")
 
         # Initialize Vector Database
         self.db = VectorDatabase(db_path=vector_db_path, model_name=model_name)
@@ -43,13 +102,15 @@ class OllamaToolAgent:
         # Store session in vector DB for memory tool
         self.db._current_session = self.session_id
 
+        # Vault logging path
+        self.vault_path = os.getenv("PALADIN_VAULT_PATH")
+
         # Initialize ChatOllama
         self.llm = ChatOllama(
             model=model_name,
             base_url=base_url,
-            temperature=0.1,  # Very low but not zero to allow some flexibility
-            num_predict=1024,  # Increased to prevent truncation of responses
-            timeout="5m"  # Add explicit timeout for LLM calls
+            temperature=0.4, # 0.2, 2048
+            num_predict=8192, # Larger context for code generation
         )
 
         # Load tools from database
@@ -58,32 +119,7 @@ class OllamaToolAgent:
 
         # Bootstrap from memory if requested
         if init_search_query:
-            past = self.db.similarity_search(
-                init_search_query,
-                session_id=self.session_id,
-                include_other_sessions=True,
-                limit=5,
-                threshold=0.2
-            )
-            if past:
-                preview = []
-                for item in past:
-                    if item['source'] == 'chat':
-                        preview.append(f"[{item['session_id'][:6]}:{item['type']}] {item['content'][:120]}")
-                    else:
-                        try:
-                            params = json.loads(item['parameters']) if item.get('parameters') else {}
-                        except Exception:
-                            params = item.get('parameters')
-                        preview.append(
-                            f"[{item['session_id'][:6]}:TOOL {item['tool']}] "
-                            f"{str(params)[:60]} -> {str(item['result'])[:60]}"
-                        )
-                console.print(Panel(
-                    Text("Loaded prior context:\n" + "\n".join(preview), style="magenta"),
-                    title="Memory Bootstrap",
-                    border_style="magenta"
-                ))
+            self._bootstrap_memory(init_search_query)
 
         console.print(Panel(
             Text(
@@ -98,6 +134,34 @@ class OllamaToolAgent:
             border_style="green"
         ))
 
+    def _bootstrap_memory(self, query: str):
+        past = self.db.similarity_search(
+            query,
+            session_id=self.session_id,
+            include_other_sessions=True,
+            limit=5,
+            threshold=0.2
+        )
+        if past:
+            preview = []
+            for item in past:
+                if item['source'] == 'chat':
+                    preview.append(f"[{item['session_id'][:6]}:{item['type']}] {item['content'][:120]}")
+                else:
+                    try:
+                        params = json.loads(item['parameters']) if item.get('parameters') else {}
+                    except Exception:
+                        params = item.get('parameters')
+                    preview.append(
+                        f"[{item['session_id'][:6]}:TOOL {item['tool']}] "
+                        f"{str(params)[:60]} -> {str(item['result'])[:60]}"
+                    )
+            console.print(Panel(
+                Text("Loaded prior context:\n" + "\n".join(preview), style="magenta"),
+                title="Memory Bootstrap",
+                border_style="magenta"
+            ))
+
     def cleanup(self):
         """Close database connections."""
         try:
@@ -106,66 +170,101 @@ class OllamaToolAgent:
         except Exception as e:
             logger.warning(f"Could not close database cleanly: {e}")
 
+    def _log_to_vault(self, query: str, response: str):
+        """Appends the chat interaction to the configured Obsidian vault file."""
+        if not self.vault_path:
+            return
+            
+        try:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            os.makedirs(os.path.dirname(os.path.abspath(self.vault_path)), exist_ok=True)
+            
+            with open(self.vault_path, "a", encoding="utf-8") as f:
+                f.write(f"\n## {timestamp}\n")
+                f.write(f"**User:** {query}\n\n")
+                f.write(f"**AI:**\n{response}\n")
+                f.write("\n---\n")
+        except Exception as e:
+            console.print(f"[yellow]Warning: Failed to log to vault at {self.vault_path}: {e}[/yellow]")
+
+    def _get_cwd_context(self) -> str:
+        """Get current working directory context for the prompt."""
+        try:
+            cwd = os.getcwd()
+            files = os.listdir(cwd)
+            visible_files = [f for f in files if not f.startswith('.')]
+            if len(visible_files) > 20:
+                file_list = ", ".join(visible_files[:20]) + f", ... (+{len(visible_files)-20} more)"
+            else:
+                file_list = ", ".join(visible_files) or "(empty)"
+            
+            return f"Current Path: {cwd}\nFiles here: {file_list}"
+        except Exception as e:
+            return f"Error getting path context: {e}"
+
+    def _get_project_instructions(self) -> str:
+        """Load project-specific instructions from a local file."""
+        try:
+            cwd = os.getcwd()
+            instruct_path = os.path.join(cwd, "PALADIN_INSTRUCTIONS.md")
+            if os.path.exists(instruct_path):
+                with open(instruct_path, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                if content:
+                    return f"\nPROJECT SPECIFIC INSTRUCTIONS:\n{content}\n"
+            return ""
+        except Exception:
+            return ""
+
     def _create_agent(self) -> AgentExecutor:
-        """Creates the LangChain ReAct agent."""
-        template = """Answer the following questions as best you can. You have access to the following tools:
+        """Creates the LangChain Native Tool Calling agent."""
+        
+        # 1. Define the Chat Prompt
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are Paladin, an expert AI software engineer.
+Your goal is to complete tasks efficiently and safely using your available tools.
 
-{tools}
+## Core Directives
+1. **Verification**: Always verify file locations and contents before editing. Do not guess.
+2. **Safety**: Analyze potential risks before executing system commands.
+3. **Memory**: Use the provided `Relevant Past Memories` to inform your decisions and maintain continuity.
+4. **Tool Usage**: You may call multiple tools in sequence to accomplish a goal.
 
-Use the following format EXACTLY:
+## Context
+### Working Directory
+{cwd_context}
 
-Thought: I should use a tool to help with this task
-Action: the action to take, must be one of [{tool_names}]
-Action Input: the input to the action
-Observation: the result of the action
-... (repeat Thought/Action/Action Input/Observation as needed)
-Thought: I now know the final answer
-Final Answer: the final answer to the original input question
+### Relevant Past Memories
+{memory_context}
 
-IMPORTANT:
-- Always use the EXACT format above
-- Put only the tool name after "Action:"
-- Put only the input after "Action Input:"
-- Do NOT write "Observation:" yourself - it will be provided to you
-- Stop after writing "Action Input:" and wait for the Observation
+{project_instructions}
+"""),
+            ("placeholder", "{chat_history}"),
+            ("human", "{input}"),
+            ("placeholder", "{agent_scratchpad}"),
+        ])
 
-Begin!
+        # 2. Bind tools to the LLM (This enables Native Tool Calling)
+        # Qwen supports this natively via Ollama
+        llm_with_tools = self.llm.bind_tools(self.tools)
 
-Question: {input}
-Thought:{agent_scratchpad}"""
-
-        prompt = PromptTemplate.from_template(template)
-        agent = create_react_agent(self.llm, self.tools, prompt)
-
-        # Custom parsing error handler with fallback
-        parse_error_count = {"count": 0}
-
-        def handle_parse_error(error) -> str:
-            parse_error_count["count"] += 1
-            logger.warning(f"Parse error #{parse_error_count['count']}: {error}")
-
-            # After 2 parse errors, force a final answer
-            if parse_error_count["count"] >= 2:
-                return "Too many formatting errors. Providing best available answer based on context so far."
-
-            return f"Could not parse LLM output. Please respond using the exact format:\nThought: [your thought]\nAction: [tool name]\nAction Input: [input]\n\nError details: {str(error)}"
+        # 3. Create the Agent
+        agent = create_tool_calling_agent(llm_with_tools, self.tools, prompt)
 
         agent_executor = AgentExecutor(
             agent=agent,
             tools=self.tools,
-            verbose=True,
-            max_iterations=3,  # Reduced from 5 to fail even faster
-            max_execution_time=30,  # Reduced from 60 to fail faster
-            handle_parsing_errors=handle_parse_error,  # Custom error handler with counter
-            early_stopping_method="generate",  # Return what we have so far on failure
-            return_intermediate_steps=False  # Don't clutter output
+            verbose=False,
+            max_iterations=15, 
+            max_execution_time=900,
+            early_stopping_method="generate",
+            return_intermediate_steps=False,
+            callbacks=[RichCallbackHandler(console)]
         )
         return agent_executor
 
     def chat(self, message: str) -> str:
         """Processes a chat message, running the agent and updating memory."""
-        import signal
-        from contextlib import contextmanager
 
         @contextmanager
         def timeout_context(seconds):
@@ -173,7 +272,6 @@ Thought:{agent_scratchpad}"""
             def timeout_handler(signum, frame):
                 raise TimeoutError(f"Agent execution exceeded {seconds} seconds")
 
-            # Set the signal handler and alarm
             old_handler = signal.signal(signal.SIGALRM, timeout_handler)
             signal.alarm(seconds)
             try:
@@ -182,7 +280,7 @@ Thought:{agent_scratchpad}"""
                 signal.alarm(0)
                 signal.signal(signal.SIGALRM, old_handler)
 
-        self.db.add_message(self.session_id, "human", message)
+        self.db.add_message(self.session_id, "human", message) if self.save_history else None
 
         console.print(Panel(
             Text(f"Human: {message}", style="bold blue"),
@@ -190,24 +288,94 @@ Thought:{agent_scratchpad}"""
             border_style="blue"
         ))
 
+        # Handle Command Prefixes
+        if message.startswith("//"):
+            # Chat Mode: Direct LLM Call (Bypass Agent)
+            chat_input = message[2:].strip()
+            try:
+                response_obj = self.llm.invoke(chat_input)
+                response = response_obj.content
+            except Exception as e:
+                response = f"Chat Error: {e}"
+            
+            self.db.add_message(self.session_id, "assistant", response) if self.save_history else None
+            console.print(Panel(
+                Text(f"AI: {response}", style="bold green"),
+                title="Output",
+                border_style="green"
+            ))
+            self._log_to_vault(message, response)
+            return response
+
+        elif message.startswith("\\\\"):
+            # Force Tool Mode
+            llm_input = message[2:].strip() + "\n\nCONSTRAINT: You MUST use a tool to handle this request."
+        else:
+            # Standard Mode
+            llm_input = message
+
         try:
-            # Add a hard timeout of 45 seconds (15 seconds buffer over agent's 30s timeout)
-            with timeout_context(45):
-                result = self.agent_executor.invoke({"input": message})
+            with timeout_context(330):
+                cwd_context = self._get_cwd_context()
+                project_instructions = self._get_project_instructions()
+                
+                # Fetch recent chat history (Short-term memory)
+                raw_history = self.db.get_recent_history(self.session_id, limit=10)
+                chat_history = []
+                for msg in raw_history:
+                    if msg['type'] == 'human':
+                        chat_history.append(HumanMessage(content=msg['content']))
+                    elif msg['type'] == 'assistant':
+                        chat_history.append(AIMessage(content=msg['content']))
+
+                # Fetch relevant memories (Long-term memory / RAG)
+                # We search across all sessions to find relevant past knowledge
+                memories = self.db.similarity_search(
+                    llm_input, 
+                    session_id=self.session_id,
+                    include_other_sessions=True,
+                    limit=3,
+                    threshold=0.25
+                )
+                
+                memory_context = ""
+                if memories:
+                    memory_lines = []
+                    for m in memories:
+                        if m['source'] == 'chat':
+                            memory_lines.append(f"- Chat Log: {m['content']}")
+                        elif m['source'] == 'tool_execution':
+                            memory_lines.append(f"- Tool Result ({m['tool']}): {m['result'][:200]}...")
+                        elif m['source'] == 'document':
+                            memory_lines.append(f"- Document ({m['file_path']}): {m['content'][:200]}...")
+                        elif m['source'] == 'fact':
+                            memory_lines.append(f"- Fact: {m['content']}")
+                    memory_context = "\n".join(memory_lines)
+                else:
+                    memory_context = "(No relevant memories found)"
+
+                result = self.agent_executor.invoke({
+                    "input": llm_input,
+                    "cwd_context": cwd_context,
+                    "project_instructions": project_instructions,
+                    "memory_context": memory_context,
+                    "chat_history": chat_history
+                })
                 response = result.get('output', 'No response generated.')
 
-            self.db.add_message(self.session_id, "assistant", response)
+            self.db.add_message(self.session_id, "assistant", response) if self.save_history else None
 
             console.print(Panel(
                 Text(f"AI: {response}", style="bold green"),
                 title="Output",
                 border_style="green"
             ))
+            self._log_to_vault(message, response)
             return response
 
         except TimeoutError as e:
-            error_msg = f"Agent Timeout: {e}. The agent took too long to respond. Try simplifying your request."
-            self.db.add_message(self.session_id, "assistant", error_msg)
+            error_msg = f"Agent Timeout: {e}. The agent took too long to respond."
+            self.db.add_message(self.session_id, "assistant", error_msg) if self.save_history else None
             console.print(Panel(
                 Text(error_msg, style="bold red"),
                 title="Timeout",
@@ -218,7 +386,7 @@ Thought:{agent_scratchpad}"""
 
         except Exception as e:
             error_msg = f"Agent Execution Error: {e}"
-            self.db.add_message(self.session_id, "assistant", error_msg)
+            self.db.add_message(self.session_id, "assistant", error_msg) if self.save_history else None
             console.print(Panel(
                 Text(error_msg, style="bold red"),
                 title="Error",
@@ -229,9 +397,8 @@ Thought:{agent_scratchpad}"""
 
     def execute_tool_chain(self, chain_definition: List[Dict[str, Any]],
                           continue_on_error: bool = False) -> Dict[str, Union[bool, str]]:
-        """Executes a predefined sequence of tools, passing results between steps."""
+        """Executes a predefined sequence of tools."""
         console.print(Text("Executing tool chain...", style="yellow"))
-
         context = {}
 
         for i, step in enumerate(chain_definition):
@@ -241,7 +408,6 @@ Thought:{agent_scratchpad}"""
 
             console.print(f"[Step {i+1}]: Calling tool '{tool_name}' with parameters: {params}")
 
-            # Find the tool function
             tool_func = next((t.func for t in self.tools if t.name == tool_name), None)
 
             if not tool_func:
@@ -252,23 +418,22 @@ Thought:{agent_scratchpad}"""
                 continue
 
             try:
-                # Execute the tool
                 if isinstance(params, dict):
                     result = tool_func(json.dumps(params))
                 else:
                     result = tool_func(params)
 
-                self.db.add_tool_execution(
-                    self.session_id,
-                    tool_name,
-                    params if isinstance(params, dict) else {"input": params},
-                    result
-                )
+                if self.save_history:
+                    self.db.add_tool_execution(
+                        self.session_id,
+                        tool_name,
+                        params if isinstance(params, dict) else {"input": params},
+                        result
+                    )
                 console.print(f"[Step {i+1} Result]: {result[:100]}...")
 
                 if store_as:
                     context[store_as] = result
-                    console.print(f"[Context]: Stored result as '{store_as}'")
 
             except Exception as e:
                 error_msg = f"Error executing tool '{tool_name}': {e}"
@@ -279,20 +444,6 @@ Thought:{agent_scratchpad}"""
         console.print(Text("Tool chain finished.", style="yellow"))
         return {"success": True, "context": context}
 
-    def execute_template(self, template_name: str, user_params: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute a tool template (workflow) from the database."""
-        return self.tool_registry.execute_template(
-            template_name,
-            user_params,
-            self.agent_executor,
-            self.session_id
-        )
-
     def list_available_tools(self) -> List[str]:
         """List all available tool names."""
         return [tool.name for tool in self.tools]
-
-    def list_available_templates(self) -> List[Dict[str, str]]:
-        """List all available templates."""
-        templates = self.tool_registry.load_templates()
-        return [{'name': t['name'], 'description': t['description']} for t in templates]

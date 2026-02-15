@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tool Registry - Dynamic Tool Loading from Database
+Tool Registry - Dynamic Tool Loading from Database + MCP Servers
 Manages tool discovery, validation, and execution
 """
 
@@ -31,18 +31,19 @@ def _find_tool_db() -> str:
     if cwd_path.exists():
         return str(cwd_path)
 
-    return "/home/grim/Desktop/Projects/Paladin/TOOL_DB/tools.db"
+    return "/home/grim/Desktop/op/TOOL_DB/tools.db"
 
 TOOL_DB_PATH = _find_tool_db()
 
 
 class ToolRegistry:
-    """Manages dynamic tool loading from the global tool database."""
+    """Manages dynamic tool loading from the global tool database and MCP servers."""
 
-    def __init__(self, db_path: str = TOOL_DB_PATH, vector_db=None, enable_mcp: bool = True):
+    def __init__(self, db_path: str = TOOL_DB_PATH, vector_db=None, enable_mcp: bool = True, mcp_config_path: str = None):
         self.db_path = db_path or TOOL_DB_PATH
         self.vector_db = vector_db
         self.enable_mcp = enable_mcp
+        self.mcp_config_path = mcp_config_path
         self.tool_cache: Dict[str, Callable] = {}
         self._verify_database()
 
@@ -125,7 +126,35 @@ class ToolRegistry:
         return create_model(f"{tool_name}Input", **fields)
 
     def load_tools(self, category: Optional[str] = None, enabled_only: bool = True) -> List[StructuredTool]:
-        """Load all tools from the database as LangChain StructuredTool objects."""
+        """Load all tools from the database and MCP servers as LangChain StructuredTool objects."""
+        all_tools = []
+        
+        # Load database tools
+        db_tools = self._load_database_tools(category, enabled_only)
+        all_tools.extend(db_tools)
+        
+        # Load memory tools if vector_db is available
+        if self.vector_db:
+            memory_tools = self._create_memory_tools()
+            all_tools.extend(memory_tools)
+        
+        # Load MCP tools
+        if self.enable_mcp:
+            try:
+                from .mcp_integration import load_mcp_tools
+                mcp_tools = load_mcp_tools(self.mcp_config_path)
+                all_tools.extend(mcp_tools)
+                logger.info(f"Loaded {len(mcp_tools)} tools from MCP servers")
+            except ImportError:
+                logger.warning("MCP integration module not found. Install 'mcp' package: pip install mcp")
+            except Exception as e:
+                logger.error(f"Error loading MCP tools: {e}")
+        
+        logger.info(f"Total tools loaded: {len(all_tools)} (DB: {len(db_tools)}, MCP: {len(all_tools) - len(db_tools) - (len(self._create_memory_tools()) if self.vector_db else 0)})")
+        return all_tools
+
+    def _load_database_tools(self, category: Optional[str] = None, enabled_only: bool = True) -> List[StructuredTool]:
+        """Load tools from the SQLite database."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
@@ -180,11 +209,6 @@ class ToolRegistry:
             tools.append(tool)
 
         conn.close()
-
-        # Add memory tools
-        if self.vector_db:
-            tools.extend(self._create_memory_tools())
-
         logger.info(f"Loaded {len(tools)} tools from database")
         return tools
 

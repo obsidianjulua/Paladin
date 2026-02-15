@@ -1,0 +1,45 @@
+name: Paladin MCP Servers
+version: 1.0.0
+schema: v1
+
+mcpServers:
+  - name: obsidian
+    command: python
+    args:
+      - -m
+      - obsidian_mcp
+    env:
+      OBSIDIAN_VAULT_PATH: /home/grim/Documents/ObsidianVault
+
+  - name: filesystem
+    command: npx
+    args:
+      - -y
+      - "@modelcontextprotocol/server-filesystem"
+      - /home/grim
+    env: {}
+
+  - name: git
+    command: npx
+    args:
+      - -y
+      - "@modelcontextprotocol/server-git"
+      - --repository
+      - /home/grim/Projects
+    env: {}
+
+  - name: brave-search
+    command: npx
+    args:
+      - -y
+      - "@modelcontextprotocol/server-brave-search"
+    env:
+      BRAVE_API_KEY: your-api-key-here
+
+  - name: postgres
+    command: npx
+    args:
+      - -y
+      - "@modelcontextprotocol/server-postgres"
+    env:
+      POSTGRES_CONNECTION_STRING: postgresql://user:password@localhost/dbname

@@ -9,12 +9,18 @@ import json
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
-DB_PATH = "/home/grim/Desktop/op/TOOL_DB/tools.db"
+import os
 
+# Dynamic path resolution
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "tools.db"
 
 def init_tool_database():
     """Initialize the tool database with schema."""
-    conn = sqlite3.connect(DB_PATH)
+    # Ensure directory exists
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    
+    conn = sqlite3.connect(str(DB_PATH))
     cursor = conn.cursor()
 
     # Tools table - stores tool definitions
