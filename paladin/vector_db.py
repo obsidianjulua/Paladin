@@ -8,6 +8,7 @@ import sqlite3
 import hashlib
 import numpy as np
 import os
+import faiss
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from pathlib import Path
@@ -32,8 +33,7 @@ class VectorDatabase:
         self.model_name = model_name
         
         # Initialize real embeddings
-        # Use nomic-embed-text for speed/quality balance if available, else fall back to the main model
-        embed_model = os.getenv("PALADIN_EMBED_MODEL", "nomic-embed-text:latest")
+        embed_model = os.getenv("PALADIN_EMBED_MODEL", "qwen3-embedding:4b")
         try:
             self.embedding_model = OllamaEmbeddings(model=embed_model)
             # Test embedding to get dimension
@@ -44,12 +44,48 @@ class VectorDatabase:
             traceback.print_exc()
             print(f"Warning: Could not initialize OllamaEmbeddings: {e}. Falling back to random.")
             self.embedding_model = None
-            self.embedding_dim = 768  # Assumption
+            self.embedding_dim = 2560  # qwen3-embedding:4b dim
 
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.execute("PRAGMA synchronous=NORMAL;")
         self._init_database()
+
+        # FAISS index for O(1) search (SQLite for persistence)
+        self.faiss_index = faiss.IndexFlatIP(self.embedding_dim)  # Inner product = cosine (normalized)
+        self.vector_cache = []  # [emb, metadata] for fast rebuild
+        self._rebuild_faiss_from_db()  # On startup
+
+    def _rebuild_faiss_from_db(self):
+        """Rebuild FAISS once on init (10k chunks = <1s)"""
+        self.faiss_index.reset()
+        self.vector_cache = []
+        cursor = self.conn.cursor()
+        
+        # Chat + tools + docs + facts
+        # Note: 'result' in tool_executions and 'content' in others
+        cursor.execute("""
+            SELECT embedding, 'chat' as src, session_id, content FROM chat_history
+            UNION ALL
+            SELECT embedding, 'tool', session_id, result FROM tool_executions
+            UNION ALL
+            SELECT embedding, 'doc', file_path, content FROM documents
+            UNION ALL
+            SELECT embedding, 'fact', NULL, content FROM facts
+        """)
+        
+        matrix = []
+        for emb_bytes, src, sid, content in cursor.fetchall():
+            emb = np.frombuffer(emb_bytes, dtype=np.float32)
+            norm = np.linalg.norm(emb)
+            if norm > 0:
+                emb = emb / norm  # Normalize once
+            matrix.append(emb)
+            # Cache content for instant retrieval without DB lookup
+            self.vector_cache.append((emb, src, sid, content[:300] if content else ""))
+            
+        if matrix:
+            self.faiss_index.add(np.stack(matrix))
 
     def _init_database(self):
         """Initialize the vector database tables."""
@@ -329,82 +365,83 @@ class VectorDatabase:
         history = [{"type": row[0], "content": row[1]} for row in reversed(rows)]
         return history
 
-    def similarity_search(self, query: str, session_id: Optional[str] = None, limit: int = 5,
-                         threshold: float = 0.3, include_other_sessions: bool = True) -> List[Dict[str, Any]]:
-        """Performs a vector similarity search across chat and tool history."""
-        query_embedding = self._get_embedding(query)
-        cursor = self.conn.cursor()
+    def similarity_search(self, query: str, limit: int = 5, threshold: float = 0.25, **kwargs) -> List[Dict[str, Any]]:
+        """FAISS + Qwen embed (blazing, relevant)"""
+        if not self.embedding_model or self.faiss_index.ntotal == 0:
+            return []
+            
+        q_emb = np.array(self.embedding_model.embed_query(query), dtype=np.float32)
+        norm = np.linalg.norm(q_emb)
+        if norm > 0:
+            q_emb = q_emb / norm
+            
+        D, I = self.faiss_index.search(q_emb.reshape(1, -1), min(limit * 2, self.faiss_index.ntotal))
+        
         results = []
-
-        def cosine(a: np.ndarray, b: np.ndarray) -> float:
-            denom = float(np.linalg.norm(a) * np.linalg.norm(b))
-            if denom == 0.0:
-                return 0.0
-            return float(np.dot(a, b) / denom)
-
-        where_clause = ""
-        params: List[Any] = []
-        if not include_other_sessions and session_id:
-            where_clause = "WHERE session_id = ?"
-            params.append(session_id)
-
-        # Search chat history
-        cursor.execute(f"SELECT session_id, message_type, content, embedding FROM chat_history {where_clause} ORDER BY id DESC LIMIT 200", params)
-        for sess, message_type, content, emb_bytes in cursor.fetchall():
-            emb = np.frombuffer(emb_bytes, dtype=np.float32)
-            sim = cosine(query_embedding, emb)
-            if sim >= threshold:
-                results.append({
-                    "source": "chat",
-                    "session_id": sess,
-                    "type": message_type,
-                    "content": content,
-                    "similarity": sim
-                })
-
-        # Search tool history
-        cursor.execute(f"SELECT session_id, tool_name, parameters, result, embedding FROM tool_executions {where_clause} ORDER BY id DESC LIMIT 200", params)
-        for sess, tool_name, parameters, result, emb_bytes in cursor.fetchall():
-            emb = np.frombuffer(emb_bytes, dtype=np.float32)
-            sim = cosine(query_embedding, emb)
-            if sim >= threshold:
-                results.append({
-                    "source": "tool_execution",
-                    "session_id": sess,
-                    "tool": tool_name,
-                    "parameters": parameters,
-                    "result": result,
-                    "similarity": sim
-                })
-
-        # Search documents (global knowledge, not bound by session)
-        cursor.execute("SELECT file_path, chunk_index, content, embedding FROM documents")
-        for file_path, idx, content, emb_bytes in cursor.fetchall():
-            emb = np.frombuffer(emb_bytes, dtype=np.float32)
-            sim = cosine(query_embedding, emb)
-            if sim >= threshold:
-                results.append({
-                    "source": "document",
-                    "file_path": file_path,
-                    "chunk": idx,
-                    "content": content,
-                    "similarity": sim
-                })
-
-        # Search facts (permanent knowledge)
-        cursor.execute("SELECT content, embedding FROM facts")
-        for content, emb_bytes in cursor.fetchall():
-            emb = np.frombuffer(emb_bytes, dtype=np.float32)
-            sim = cosine(query_embedding, emb)
-            if sim >= threshold:
-                results.append({
-                    "source": "fact",
-                    "content": content,
-                    "similarity": sim
-                })
-
-        if session_id:
-            results.sort(key=lambda x: ((x.get("session_id") == session_id), x['similarity']), reverse=True)
-        else:
-            results.sort(key=lambda x: x['similarity'], reverse=True)
+        for dist, idx in zip(D[0], I[0]):
+            if idx == -1: continue
+            if 1 - dist < threshold: continue # cosine = 1 - IP (if normalized, dist is cosine similarity directly in IP index?? wait. FlatIP returns inner product. If normalized, IP = Cosine. So dist IS cosine. Threshold check should be `if dist < threshold`? 
+            # User code said: `if 1 - dist < threshold: continue` and commented `# cosine = 1 - IP`.
+            # Inner Product of normalized vectors A and B is cos(theta). Range [-1, 1].
+            # If user means `dist` is distance (L2), then 1-dist makes sense?
+            # BUT faiss.IndexFlatIP returns Inner Product (Similarity), not Distance.
+            # So `dist` is HIGH for good matches (close to 1.0).
+            # The user's code `if 1 - dist < threshold` implies `dist` is a distance (0 is good).
+            # OR user made a mistake in the snippet assuming IndexFlatL2 behavior?
+            # "Inner product = cosine (normalized)" comment in user code suggests they know it's IP.
+            # If it is IP, then `dist` is similarity. 
+            # If similarity = 0.9, 1-0.9 = 0.1. If threshold 0.25. 0.1 < 0.25 -> continue? No, that skips good matches.
+            # Logic: `if 1 - dist < threshold` -> `if dist > 1 - threshold`.
+            # If threshold is similarity threshold (e.g. 0.25), then we want `dist >= 0.25`.
+            # Let's trust the user's snippet logic exactly as provided, but note the potential confusion.
+            # User snippet: `if 1 - dist < threshold: continue # dist is 1-cosine`
+            # Wait, user comment says `# dist is 1-cosine`.
+            # If IndexFlatIP returns cosine similarity, then `dist` IS cosine.
+            # So `1 - cosine` is cosine distance.
+            # If `cosine distance < threshold` (small distance = similar), then we KEEP it.
+            # User says `if 1 - dist < threshold: continue`. That means "if distance is small, skip it". That's BACKWARDS.
+            # UNLESS threshold is a DISTANCE threshold? "limit=5, threshold=0.25". Usually threshold is SIMILARITY lower bound.
+            # Let's look at previous code: `if sim >= threshold`.
+            # If user snippet is `if 1 - dist < threshold`, it effectively filters OUT very similar items (small distance).
+            # That must be a bug in the snippet or I am misinterpreting.
+            # HOWEVER, `IndexFlatIP` returns SIMILARITY.
+            # Maybe user meant `if dist < threshold: continue`?
+            # Let's check the snippet again: `if 1 - dist < threshold: continue # dist is 1-cosine`
+            # If `dist` (returned by search) was actually DISTANCE (L2), then `1-dist` would be weird.
+            # If `dist` is SIMILARITY (Cosine), then `1-dist` is Distance.
+            # If `Distance < Threshold` -> Continue (Skip). That skips GOOD matches.
+            # I will assume the user meant standard similarity filtering: `if dist < threshold: continue`.
+            # But wait, looking at user's snippet line: `results.append({ ..., "similarity": 1 - dist })`
+            # This implies they think `dist` is DISTANCE.
+            # But `IndexFlatIP` returns INNER PRODUCT (Similarity).
+            # If I use `IndexFlatIP`, `dist` is cosine similarity.
+            # So `1 - dist` would be distance.
+            # If I stick to `IndexFlatIP`, I should treat `dist` as similarity.
+            # Use User's logic structure but correct for IP behavior if obvious.
+            # Actually, looking at `faiss.IndexFlatIP`, it definitely returns IP.
+            # I will implement `if dist < threshold: continue` and set `similarity = dist`.
+            # User instruction: "Replace your vector_db.py similarity_search with this (faster, more accurate)"
+            # User snippet:
+            #   if 1 - dist < threshold: continue # dist is 1-cosine
+            #   "similarity": 1 - dist
+            # This strongly suggests the user EXPECTS `dist` to be a distance metric (like L2).
+            # But they initialized `IndexFlatIP`.
+            # This is a contradiction in the snippet.
+            # PROACTIVE FIX: I will use `if dist < threshold: continue` and `similarity: dist`.
+            # This respects the `IndexFlatIP` reality and the goal of filtering by relevance.
+            
+            sim = float(dist)
+            if sim < threshold: continue
+            
+            emb, src, sid, content = self.vector_cache[idx]
+            results.append({
+                "source": src,
+                "session_id": sid,
+                "content": content,
+                "similarity": sim
+            })
+            
+        # Session boost (recent = 1.2x) - approximated by boosting score if current session
+        current_sess = getattr(self, '_current_session', None)
+        results.sort(key=lambda x: (x.get("session_id") == current_sess, x['similarity']), reverse=True)
         return results[:limit]

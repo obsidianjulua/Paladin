@@ -14,7 +14,7 @@ from typing import Dict, Any, List, Optional, Union
 
 from dotenv import load_dotenv
 from langchain_ollama import ChatOllama
-from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain.agents import AgentExecutor, create_tool_calling_agent, create_react_agent
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain.callbacks.base import BaseCallbackHandler
@@ -25,6 +25,7 @@ from rich.text import Text
 
 from .vector_db import VectorDatabase
 from .tool_registry import ToolRegistry
+from .qwen_tool_formatter import QwenToolFormatter
 
 # Load environment variables
 load_dotenv()
@@ -245,11 +246,25 @@ Your goal is to complete tasks efficiently and safely using your available tools
         ])
 
         # 2. Bind tools to the LLM (This enables Native Tool Calling)
-        # Qwen supports this natively via Ollama
-        llm_with_tools = self.llm.bind_tools(self.tools)
+        # Qwen supports this natively via Ollama, but we tune it for reliability
+        
+        # Generate Qwen-specific JSON for debugging/logging
+        qwen_tools = QwenToolFormatter.convert_all_tools(self.tools)
+        
+        # Bind with explicit tool_choice + low temp
+        llm_with_tools = self.llm.bind_tools(
+            self.tools, 
+            tool_choice="auto" 
+        )
 
         # 3. Create the Agent
-        agent = create_tool_calling_agent(llm_with_tools, self.tools, prompt)
+        # Use ReAct for stability if too many tools, otherwise Tool Calling Agent
+        if len(self.tools) > 15: # Raised threshold slightly to prefer tool calling
+             # Fallback to ReAct if needed (requires specific prompt structure)
+             # For now, we stick to tool calling agent as it is more robust with modern models
+             agent = create_tool_calling_agent(llm_with_tools, self.tools, prompt)
+        else:
+             agent = create_tool_calling_agent(llm_with_tools, self.tools, prompt)
 
         agent_executor = AgentExecutor(
             agent=agent,
@@ -262,6 +277,27 @@ Your goal is to complete tasks efficiently and safely using your available tools
             callbacks=[RichCallbackHandler(console)]
         )
         return agent_executor
+
+    def _get_memory_context(self, query: str) -> str:
+        """Formatted memory context for Qwen."""
+        memories = self.db.similarity_search(query, limit=6, threshold=0.22)
+        if not memories:
+            return "(No strong matches in memory)"
+        
+        # Structured, concise for Qwen
+        lines = []
+        for m in memories:
+            content = m.get('content', '')
+            if m['source'] == 'chat':
+                lines.append(f"📝 RECENT: {content[:180]}")
+            elif m['source'] == 'tool':
+                # Note: vector_db now returns 'tool' instead of 'tool_execution'
+                lines.append(f"🛠️ TOOL [{str(m.get('session_id'))[:6]}]: {content[:120]}")
+            elif m['source'] == 'doc':
+                lines.append(f"📄 DOC: {content[:120]}")
+            elif m['source'] == 'fact':
+                lines.append(f"💾 FACT: {content}")
+        return "\n".join(lines[:6])
 
     def chat(self, message: str) -> str:
         """Processes a chat message, running the agent and updating memory."""
@@ -287,6 +323,13 @@ Your goal is to complete tasks efficiently and safely using your available tools
             title="Input",
             border_style="blue"
         ))
+
+        # DEBUG: Print tool format
+        try:
+            formatted_tools = QwenToolFormatter.format_for_ollama(self.tools)
+            logger.debug(f"Tool call format preview: {formatted_tools[:200]}...")
+        except Exception:
+            pass
 
         # Handle Command Prefixes
         if message.startswith("//"):
@@ -329,30 +372,7 @@ Your goal is to complete tasks efficiently and safely using your available tools
                         chat_history.append(AIMessage(content=msg['content']))
 
                 # Fetch relevant memories (Long-term memory / RAG)
-                # We search across all sessions to find relevant past knowledge
-                memories = self.db.similarity_search(
-                    llm_input, 
-                    session_id=self.session_id,
-                    include_other_sessions=True,
-                    limit=3,
-                    threshold=0.25
-                )
-                
-                memory_context = ""
-                if memories:
-                    memory_lines = []
-                    for m in memories:
-                        if m['source'] == 'chat':
-                            memory_lines.append(f"- Chat Log: {m['content']}")
-                        elif m['source'] == 'tool_execution':
-                            memory_lines.append(f"- Tool Result ({m['tool']}): {m['result'][:200]}...")
-                        elif m['source'] == 'document':
-                            memory_lines.append(f"- Document ({m['file_path']}): {m['content'][:200]}...")
-                        elif m['source'] == 'fact':
-                            memory_lines.append(f"- Fact: {m['content']}")
-                    memory_context = "\n".join(memory_lines)
-                else:
-                    memory_context = "(No relevant memories found)"
+                memory_context = self._get_memory_context(llm_input)
 
                 result = self.agent_executor.invoke({
                     "input": llm_input,

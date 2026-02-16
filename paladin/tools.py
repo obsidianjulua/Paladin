@@ -202,7 +202,10 @@ class SystemTools:
 
     _SAFE_COMMANDS = ['ls', 'dir', 'cat', 'echo', 'grep', 'find', 'pwd', 'whoami', 'df',
                       'du', 'head', 'tail', 'wc', 'uname', 'hostname', 'date', 'which',
-                      'git', 'python3', 'pip3', 'npm', 'node', 'docker', 'curl', 'wget']
+                      'git', 'python3', 'pip3', 'npm', 'node', 'docker', 'curl', 'wget',
+                      'julia', 'pacman', 'venv', 'lua', 'clang', 'clang++', 'gcc', 'nm',
+                      'objdump', 'readelf', 'cp']
+
     _DANGEROUS_COMMANDS = ['rm', 'format', 'shutdown', 'reboot', 'dd', 'mkfs', 'chown', 'chmod']
 
     @staticmethod

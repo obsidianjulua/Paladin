@@ -34,4 +34,9 @@ When you need to perform an action, call the corresponding tool immediately.
 
 # Logging:
 - Vault Path: /home/grim/Documents/Archives/GrimV/Paladin_Logs.md
+
+TOOL CALLING RULES:
+- ALWAYS output valid JSON tool call if needed. No XML.
+- Max 3 tools per turn.
+- Use MCP for Obsidian/search first.
 """
